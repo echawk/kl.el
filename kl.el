@@ -50,12 +50,52 @@
 
 (defvar kl-global-functions (make-hash-table :test 'eq))
 
-(defun kl-apply-primitive (prim arg)
-  (pcase prim
-    (`(primitive ,name ,arity)
-     (if (= arity 1)
-         (apply (intern (symbol-name name)) (list arg))
-       `(primitive ,name ,(1- arity) ,arg)))))
+(defun kl-primitive-equals (a b)
+  (kl-elisp-bool-to-kl-bool
+   (kl-values-equal-p a b)))
+
+(defun kl-resolve-primitive (sym)
+  (pcase sym
+    ('+ #'+)
+    ('- #'-)
+    ('* #'*)
+    ('/ #'/)
+    ('< #'<)
+    ('> #'>)
+    ('<= #'<=)
+    ('>= #'>=)
+    ('= #'kl-primitive-equals)))
+
+(defun kl-+ (a) (lambda (b) (+ a b)))
+(defun kl-- (a) (lambda (b) (- a b)))
+(defun kl-* (a) (lambda (b) (* a b)))
+(defun kl-/ (a) (lambda (b) (/ a b)))
+(defun kl-< (a) (lambda (b) (< a b)))
+(defun kl-> (a) (lambda (b) (> a b)))
+(defun kl-<= (a) (lambda (b) (<= a b)))
+(defun kl->= (a) (lambda (b) (>= a b)))
+
+
+
+;; (dolist (pair
+;;          '((+ #'kl-+)
+;;            (- #'kl--)
+;;            (* #'kl-*)
+;;            (/ #'kl-/)
+;;            (< #'kl-<)
+;;            (> #'kl->)
+;;            (<= #'kl-<=)
+;;            (>= #'kl->=)
+;;            (= #'kl-primitive-equals)))
+
+;;   (puthash name
+;;            `(closure ,params ,body ,env)
+;;            kl-global-functions)
+;;   (puthash
+
+;;    )
+;;   )
+
 
 (defun kl-value-p (v)
   (or
@@ -82,11 +122,6 @@
 
 (defun kl-make-closure (x body env)
   `(closure ,x ,body ,env))
-
-;; (defun kl-apply-closure (rator rand)
-;;   (pcase rator
-;;     (`(closure ,x ,body ,env)
-;;      (kl-eval body (kl-extend-env x rand env)))))
 
 (defun kl-apply-closure (cl arg)
   (pcase cl
@@ -145,23 +180,17 @@
       )))
 
 
-
 (defun kl-get-time (arg env)
   (pcase arg
     ('unix (floor (float-time (current-time))))
     ('run  (- (kl-get-time 'unix env)
               (kl-eval '*init* env)))))
 
-
 (defun kl-apply1 (fn arg)
   (cond
    ;; closure
    ((and (consp fn) (eq (car fn) 'closure))
     (kl-apply-closure fn arg))
-
-   ;; primitive with arity
-   ((and (consp fn) (eq (car fn) 'primitive))
-    (kl-apply-primitive fn arg))
 
    (t
     (error "Not applicable: %S" fn))))
@@ -172,7 +201,6 @@
     (kl-apply
      (kl-apply1 fn (car args))
      (cdr args))))
-
 
 (defun kl-eval-cond (clauses env)
   (if (null clauses)
@@ -195,7 +223,7 @@
              `((*port*           . "1")
                (*porters*        . "Ethan Hawk")
                (*langauge*       . "Elisp")
-               (*version*        . "S39.1")
+               (*version*        . "S41")
                (*implementation* . ,system-configuration)
                (*release*        . ,emacs-version)
                (*os*             . ,(symbol-name system-type))
@@ -230,14 +258,13 @@
   (pcase exp
     ;; kl-values evaluate to themselves.
     ((pred kl-value-p) exp)
-    ;; Do symbols evaluate to themselves?????
-    ;; I know they do in Shen proper, but doing it here would be... Strange...
-    ;; ((pred symbolp)   (kl-apply-env env exp))
 
+    ;; They do.
     ((pred symbolp)
-     (or (gethash exp kl-global-functions)
-         (kl-apply-env env exp)))
-
+     (cond
+      ((kl-primitive-p exp)              exp)
+      ((gethash exp kl-global-functions) (kl-apply-env env exp))
+      (t exp)))
 
     ;; TODO: ensure that 'x' in this case is a single symbol!
     (`(lambda ,x ,body)  (kl-make-closure x body env))
@@ -248,25 +275,6 @@
     (`(let ,x ,y ,body)
      (kl-eval body
               (kl-extend-env x (kl-eval y env) env)))
-
-    (`(+ ,x ,y) (+ (kl-eval x env) (kl-eval y env)))
-    (`(- ,x ,y) (- (kl-eval x env) (kl-eval y env)))
-    (`(* ,x ,y) (* (kl-eval x env) (kl-eval y env)))
-    (`(/ ,x ,y) (/ (kl-eval x env) (kl-eval y env)))
-
-    (`(= ,x ,y)    (kl-elisp-bool-to-kl-bool
-                    (kl-values-equal-p
-                     (kl-eval x env)
-                     (kl-eval y env))))
-
-    (`(< ,x ,y)    (kl-elisp-bool-to-kl-bool
-                    (< (kl-eval x env)  (kl-eval y env))))
-    (`(> ,x ,y)    (kl-elisp-bool-to-kl-bool
-                    (> (kl-eval x env)  (kl-eval y env))))
-    (`(<= ,x ,y)   (kl-elisp-bool-to-kl-bool
-                    (<= (kl-eval x env) (kl-eval y env))))
-    (`(>= ,x ,y)   (kl-elisp-bool-to-kl-bool
-                    (>= (kl-eval x env) (kl-eval y env))))
 
     (`(number?  ,n) (kl-elisp-bool-to-kl-bool (numberp (kl-eval n env))))
     (`(string?  ,s) (kl-elisp-bool-to-kl-bool (stringp (kl-eval s env))))
@@ -328,20 +336,30 @@
               kl-global-functions)
      name)
 
-    (`(set   ,sym ,val) (kl-extend-env sym val env))
+    (`(set   ,sym ,val) (kl-extend-env sym (kl-eval val env) env))
     (`(value ,sym)      (kl-apply-env env sym))
 
-    (`(eval-kl ,exp) (kl-eval exp env))
+    (`(eval-kl ,exp)
+     (kl-eval (kl-eval exp env) env))
 
     (`(,f . ,args)
-     (kl-apply
-      (kl-eval f env)
-      (mapcar (lambda (a) (kl-eval a env)) args)))
+     (let ((evaled-args (mapcar (lambda (a) (kl-eval a env)) args)))
+       (cond
+        ;; primitive symbol
+        ((and (symbolp f)
+              (memq f '(+ - * / < > <= >= =)))
+         (apply (kl-resolve-primitive f) evaled-args))
 
-    ;; (`(,rator ,rand)
-    ;;  (kl-apply-closure
-    ;;   (kl-eval rator env)
-    ;;   (kl-eval rand env)))
+        ;; closure
+        (t
+         (kl-apply
+          (kl-eval f env)
+          evaled-args)))))
+
+    ;; (`(,f . ,args)
+    ;;  (kl-apply
+    ;;   (kl-eval f env)
+    ;;   (mapcar (lambda (a) (kl-eval a env)) args)))
     ))
 
 
@@ -355,7 +373,7 @@
 (ert-deftest kl-closure ()
   (should
    (eq 7
-    (kl-eval '(((lambda x (lambda y (+ x y))) 3) 4) (kl-empty-env)))
+       (kl-eval '(((lambda x (lambda y (+ x y))) 3) 4) (kl-empty-env)))
    )
   )
 
@@ -445,20 +463,25 @@
          (lambda (x y) (+ x y)))
        (kl-empty-env)))))
 
-
-(ert-deftest kl-eval-kl-application ()
-  (should
-   (= 3
-      (kl-eval
-       '(eval-kl (cons + (cons 1 (cons 2 ()))))
-       (kl-empty-env)))))
-
 (ert-deftest kl-eval-kl-basic ()
   (should
    (= 3
       (kl-eval
        '(eval-kl (cons + (cons 1 (cons 2 ()))))
        (kl-empty-env)))))
+
+(ert-deftest kl-primitive-higher-order ()
+  (should
+   (= 7
+      (kl-eval
+       '((lambda (f) (f 3 4)) +)
+       (kl-empty-env)))))
+
+(ert-deftest kl-equals-primitive ()
+  (should
+   (eq 'true
+       (kl-eval '(= 3 3) (kl-empty-env)))))
+
 
 (provide 'kl)
 
