@@ -176,16 +176,63 @@
      (kl-eval body runtime env))
     (_ (kl--signal "Cannot thaw %S" thunk))))
 
-(defun kl--apply-closure (closure arg)
-  (pcase closure
-    (`(closure ,runtime ,params ,body ,env)
-     (if (null params)
-         (kl--signal "Too many arguments for %S" closure)
-       (let ((new-env (cons (cons (car params) arg) env)))
-         (if (null (cdr params))
-             (kl-eval body runtime new-env)
-           `(closure ,runtime ,(cdr params) ,body ,new-env)))))
-    (_ (kl--signal "Invalid closure %S" closure))))
+(defun kl--apply-dispatch (fn arg)
+  (cond
+   ((and (consp fn) (eq (car fn) 'closure))
+    (pcase fn
+      (`(closure ,runtime ,params ,body ,env)
+       (if (null params)
+           (kl--signal "Too many arguments for %S" fn)
+         (let ((new-env (cons (cons (car params) arg) env)))
+           (if (null (cdr params))
+               `(eval ,body ,new-env)
+             `(value (closure ,runtime ,(cdr params) ,body ,new-env))))))))
+   ((and (consp fn) (eq (car fn) 'primitive))
+    (pcase fn
+      (`(primitive ,runtime ,name ,arity . ,args)
+       (let ((new-args (append args (list arg))))
+         (if (= arity 1)
+             `(value ,(kl--execute-primitive runtime name new-args))
+           `(value (primitive ,runtime ,name ,(1- arity) . ,new-args))))))
+    )
+   (t
+    (kl--signal "Not applicable: %S" fn))))
+
+(defun kl--force-dispatch (value)
+  (cond
+   ((and (consp value) (eq (car value) 'closure))
+    (pcase value
+      (`(closure ,_runtime ,params ,body ,env)
+       (if (null params)
+           `(eval ,body ,env)
+         `(value ,value)))))
+   ((and (consp value) (eq (car value) 'primitive))
+    (pcase value
+      (`(primitive ,runtime ,name 0 . ,args)
+       `(value ,(kl--execute-primitive runtime name args)))
+      (_ `(value ,value))))
+   (t
+    `(value ,value))))
+
+(defun kl--find-trap-frame (continuations)
+  (catch 'trap
+    (let ((stack continuations)
+          frame)
+      (while stack
+        (setq frame (pop stack))
+        (when (eq (car-safe frame) 'trap)
+          (throw 'trap (cons frame stack))))
+      nil)))
+
+(defun kl--start-cond (clauses env continuations)
+  (if (null clauses)
+      (kl--signal "condition failure")
+    (pcase (car clauses)
+      (`(,test ,expr)
+       (list test env (cons `(cond-test ,expr ,(cdr clauses) ,env)
+                            continuations)))
+      (_
+       (kl--signal "Malformed cond clause: %S" (car clauses))))))
 
 (defun kl--stream-open-p (stream)
   (and (kl-stream-p stream)
@@ -301,124 +348,200 @@
          (char-to-string byte))))
     (_ (kl--signal "Unknown primitive %S" name))))
 
-(defun kl--apply-primitive (primitive arg)
-  (pcase primitive
-    (`(primitive ,runtime ,name ,arity . ,args)
-     (let ((new-args (append args (list arg))))
-       (if (= arity 1)
-           (kl--execute-primitive runtime name new-args)
-         `(primitive ,runtime ,name ,(1- arity) . ,new-args))))
-    (_ (kl--signal "Invalid primitive application: %S" primitive))))
-
-(defun kl--apply1 (fn arg)
-  (cond
-   ((and (consp fn) (eq (car fn) 'closure))
-    (kl--apply-closure fn arg))
-   ((and (consp fn) (eq (car fn) 'primitive))
-    (kl--apply-primitive fn arg))
-   (t
-    (kl--signal "Not applicable: %S" fn))))
-
-(defun kl--force-nullary (fn)
-  (cond
-   ((and (consp fn) (eq (car fn) 'closure))
-    (pcase fn
-      (`(closure ,runtime ,params ,body ,env)
-       (if (null params)
-           (kl-eval body runtime env)
-         fn))))
-   ((and (consp fn) (eq (car fn) 'primitive))
-    (pcase fn
-      (`(primitive ,runtime ,name 0 . ,args)
-       (kl--execute-primitive runtime name args))
-      (_ fn)))
-   (t fn)))
-
-(defun kl--apply (fn args)
-  (let ((result fn))
-    (dolist (arg args)
-      (setq result (kl--apply1 result arg)))
-    (kl--force-nullary result)))
-
-(defun kl--eval-cond (clauses runtime env)
-  (if (null clauses)
-      (kl--signal "condition failure")
-    (pcase (car clauses)
-      (`(,test ,expr)
-       (if (kl--true-p (kl-eval test runtime env))
-           (kl-eval expr runtime env)
-         (kl--eval-cond (cdr clauses) runtime env)))
-      (_ (kl--signal "Malformed cond clause: %S" (car clauses))))))
-
 (defun kl-eval (exp &optional runtime env)
   (setq runtime (or runtime (kl-runtime-reset)))
   (setq env (or env (kl-empty-env)))
-  (cond
-   ((or (numberp exp) (stringp exp) (null exp) (memq exp '(true false)))
-    exp)
-   ((symbolp exp)
-    (kl--lookup-value runtime env exp))
-   ((not (consp exp))
-    exp)
-   (t
-    (pcase exp
-      (`(lambda ,params ,body)
-       (kl-make-closure params body env runtime))
-      (`(freeze ,body)
-       (kl-make-thunk body env runtime))
-      (`(thaw ,thunk)
-       (kl-thaw-thunk (kl-eval thunk runtime env)))
-      (`(let ,name ,value ,body)
-       (kl-eval body runtime
-                (cons (cons name (kl-eval value runtime env)) env)))
-      (`(if ,test ,then ,else)
-       (if (kl--true-p (kl-eval test runtime env))
-           (kl-eval then runtime env)
-         (kl-eval else runtime env)))
-      (`(and ,left ,right)
-       (if (kl--true-p (kl-eval left runtime env))
-           (kl-eval right runtime env)
-         'false))
-      (`(or ,left ,right)
-       (if (kl--true-p (kl-eval left runtime env))
-           'true
-         (kl-eval right runtime env)))
-      (`(cond . ,clauses)
-       (kl--eval-cond clauses runtime env))
-      (`(do ,left ,right)
-       (kl-eval left runtime env)
-       (kl-eval right runtime env))
-      (`(set ,symbol ,value)
-       (let ((evaluated (kl-eval value runtime env)))
-         (puthash symbol evaluated (kl-runtime-globals runtime))
-         evaluated))
-      (`(value ,symbol)
-       (let ((value (kl--global-bound-p runtime symbol)))
-         (if (eq value :kl-unbound)
-             (kl--signal "value of %S is unbound" symbol)
-           value)))
-      (`(trap-error ,body ,handler)
-       (condition-case err
-           (kl-eval body runtime env)
-         (error
-          (kl--apply (kl-eval handler runtime env) (list err)))))
-      (`(type ,symbol ,value)
-       (puthash symbol value (kl-runtime-types runtime))
-       symbol)
-      (`(eval-kl ,value)
-       (kl-eval (kl-eval value runtime env) runtime env))
-      (`(defun ,name ,params ,body)
-       (puthash name
-                (kl-make-closure params body nil runtime)
-                (kl-runtime-functions runtime))
-       name)
-      (`(,fn . ,args)
-       (let ((callable (if (symbolp fn)
-                           (kl--resolve-function runtime env fn)
-                         (kl-eval fn runtime env))))
-         (kl--apply callable
-                    (mapcar (lambda (arg) (kl-eval arg runtime env)) args))))
-      (_ (kl--signal "Cannot evaluate %S" exp))))))
+  ;; Use an explicit continuation stack so deep KL terms and KL tail calls
+  ;; do not consume the host evaluator's recursion limit.
+  (catch 'kl-eval-done
+    (let ((mode 'eval)
+          (value nil)
+          (continuations nil)
+          dispatch)
+      (while t
+        (condition-case err
+            (cond
+             ((eq mode 'eval)
+              (cond
+               ((or (numberp exp) (stringp exp) (null exp) (memq exp '(true false)))
+                (setq value exp
+                      mode 'return))
+               ((symbolp exp)
+                (setq value (kl--lookup-value runtime env exp)
+                      mode 'return))
+               ((not (consp exp))
+                (setq value exp
+                      mode 'return))
+               (t
+                (pcase exp
+                  (`(lambda ,params ,body)
+                   (setq value (kl-make-closure params body env runtime)
+                         mode 'return))
+                  (`(freeze ,body)
+                   (setq value (kl-make-thunk body env runtime)
+                         mode 'return))
+                  (`(thaw ,thunk)
+                   (push '(thaw) continuations)
+                   (setq exp thunk))
+                  (`(let ,name ,binding ,body)
+                   (push `(let ,name ,body ,env) continuations)
+                   (setq exp binding))
+                  (`(if ,test ,then ,else)
+                   (push `(if ,then ,else ,env) continuations)
+                   (setq exp test))
+                  (`(and ,left ,right)
+                   (push `(and ,right ,env) continuations)
+                   (setq exp left))
+                  (`(or ,left ,right)
+                   (push `(or ,right ,env) continuations)
+                   (setq exp left))
+                  (`(cond . ,clauses)
+                   (pcase-let ((`(,next-exp ,next-env ,next-k)
+                                (kl--start-cond clauses env continuations)))
+                     (setq exp next-exp
+                           env next-env
+                           continuations next-k)))
+                  (`(do ,left ,right)
+                   (push `(do ,right ,env) continuations)
+                   (setq exp left))
+                  (`(set ,symbol ,binding)
+                   (push `(set ,symbol) continuations)
+                   (setq exp binding))
+                  (`(value ,symbol)
+                   (let ((bound (kl--global-bound-p runtime symbol)))
+                     (if (eq bound :kl-unbound)
+                         (kl--signal "value of %S is unbound" symbol)
+                       (setq value bound
+                             mode 'return))))
+                  (`(trap-error ,body ,handler)
+                   (push `(trap ,handler ,env) continuations)
+                   (setq exp body))
+                  (`(type ,symbol ,type-value)
+                   (puthash symbol type-value (kl-runtime-types runtime))
+                   (setq value symbol
+                         mode 'return))
+                  (`(eval-kl ,inner)
+                   (push '(eval-kl) continuations)
+                   (setq exp inner))
+                  (`(defun ,name ,params ,body)
+                   (puthash name
+                            (kl-make-closure params body nil runtime)
+                            (kl-runtime-functions runtime))
+                   (setq value name
+                         mode 'return))
+                  (`(,fn . ,args)
+                   (if (symbolp fn)
+                       (let ((callable (kl--resolve-function runtime env fn)))
+                         (setq value callable
+                               mode 'return)
+                         (push `(apply-seq ,args ,env) continuations))
+                     (push `(call-fn ,args ,env) continuations)
+                     (setq exp fn)))
+                  (_
+                   (kl--signal "Cannot evaluate %S" exp))))))
+             ((eq mode 'return)
+              (if (null continuations)
+                  (throw 'kl-eval-done value)
+                (pcase (pop continuations)
+                  (`(thaw)
+                   (pcase value
+                     (`(thunk ,_runtime ,body ,thunk-env)
+                      (setq exp body
+                            env thunk-env
+                            mode 'eval))
+                     (_
+                      (kl--signal "Cannot thaw %S" value))))
+                  (`(let ,name ,body ,saved-env)
+                   (setq env (cons (cons name value) saved-env)
+                         exp body
+                         mode 'eval))
+                  (`(if ,then ,else ,saved-env)
+                   (setq env saved-env
+                         exp (if (kl--true-p value) then else)
+                         mode 'eval))
+                  (`(and ,right ,saved-env)
+                   (if (kl--true-p value)
+                       (setq env saved-env
+                             exp right
+                             mode 'eval)
+                     (setq value 'false)))
+                  (`(or ,right ,saved-env)
+                   (if (kl--true-p value)
+                       (setq value 'true)
+                     (setq env saved-env
+                           exp right
+                           mode 'eval)))
+                  (`(cond-test ,then ,remaining ,saved-env)
+                   (if (kl--true-p value)
+                       (setq env saved-env
+                             exp then
+                             mode 'eval)
+                     (pcase-let ((`(,next-exp ,next-env ,next-k)
+                                  (kl--start-cond remaining saved-env continuations)))
+                       (setq exp next-exp
+                             env next-env
+                             continuations next-k
+                             mode 'eval))))
+                  (`(do ,right ,saved-env)
+                   (setq env saved-env
+                         exp right
+                         mode 'eval))
+                  (`(set ,symbol)
+                   (puthash symbol value (kl-runtime-globals runtime)))
+                  (`(trap ,_handler ,_saved-env))
+                  (`(eval-kl)
+                   (setq exp value
+                         mode 'eval))
+                  (`(call-fn ,args ,saved-env)
+                   (push `(apply-seq ,args ,saved-env) continuations))
+                  (`(apply-seq ,args ,saved-env)
+                   (if (null args)
+                       (pcase (kl--force-dispatch value)
+                         (`(value ,next-value)
+                          (setq value next-value))
+                         (`(eval ,next-exp ,next-env)
+                          (setq exp next-exp
+                                env next-env
+                                mode 'eval)))
+                     (push `(eval-arg ,value () ,(cdr args) ,saved-env) continuations)
+                     (setq exp (car args)
+                           env saved-env
+                           mode 'eval)))
+                  (`(eval-arg ,fn ,done ,remaining ,saved-env)
+                   (let ((new-done (cons value done)))
+                     (if remaining
+                         (push `(eval-arg ,fn ,new-done ,(cdr remaining) ,saved-env)
+                               continuations)
+                       (push `(apply-values ,(nreverse new-done)) continuations)
+                       (setq value fn)))
+                   (when remaining
+                     (setq exp (car remaining)
+                           env saved-env
+                           mode 'eval)))
+                  (`(apply-values ,args)
+                   (if (null args)
+                       (setq mode 'return)
+                     (setq dispatch (kl--apply-dispatch value (car args)))
+                     (pcase dispatch
+                       (`(value ,next-value)
+                        (setq value next-value)
+                        (push `(apply-values ,(cdr args)) continuations))
+                       (`(eval ,next-exp ,next-env)
+                        (setq exp next-exp
+                              env next-env
+                              mode 'eval)
+                        (push `(apply-values ,(cdr args)) continuations))))))))
+             (t
+              (kl--signal "Unknown evaluator mode %S" mode)))
+          (error
+           (let ((trap (kl--find-trap-frame continuations)))
+             (if trap
+                 (pcase-let ((`((trap ,handler ,handler-env) . ,rest) trap))
+                   (setq continuations (cons `(apply-values ,(list err)) rest)
+                         exp handler
+                         env handler-env
+                         mode 'eval))
+               (signal (car err) (cdr err))))))))))
 
 (defun kl-read-buffer ()
   (let (forms)
@@ -532,6 +655,17 @@
     (kl-load-kernel runtime)
     (should (gethash 'shen.initialise (kl-runtime-functions runtime)))
     (should (gethash 'shen.klfile (kl-runtime-functions runtime)))))
+
+(ert-deftest kl-initialises-shen-runtime ()
+  (let ((runtime (kl-runtime-reset)))
+    (kl-load-kernel runtime)
+    (kl-eval '(shen.initialise) runtime)
+    (should (= 2 (kl-eval '(arity cons) runtime)))
+    (should (equal "41.2" (kl-eval '(value *version*) runtime)))
+    (should (eq 'false (kl-eval '(value shen.*tc*) runtime)))
+    (should (= 3
+               (kl-eval '(eval (cons + (cons 1 (cons 2 ()))))
+                        runtime)))))
 
 (ert-deftest kl-validator-compatibility ()
   (skip-unless (file-executable-p (expand-file-name "bins/kl" default-directory)))
