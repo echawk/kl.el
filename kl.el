@@ -58,7 +58,8 @@
                  (format " *kl-%s-%s*" kind (or path mode)))))
     (when initial-contents
       (with-current-buffer buffer
-        (insert initial-contents)))
+        (insert initial-contents)
+        (goto-char (point-min))))
     (kl-stream-create :kind kind :mode mode :path path :buffer buffer :closed nil)))
 
 (defun kl-runtime-reset (&optional stdin)
@@ -91,6 +92,25 @@
 (defun kl-runtime-output (runtime)
   (with-current-buffer (kl-stream-buffer (kl-runtime-stdout runtime))
     (buffer-string)))
+
+(defun kl-runtime-clear-output (runtime)
+  (with-current-buffer (kl-stream-buffer (kl-runtime-stdout runtime))
+    (erase-buffer)))
+
+(defun kl-runtime-drain-output (runtime)
+  (prog1 (kl-runtime-output runtime)
+    (kl-runtime-clear-output runtime)))
+
+(defun kl-runtime-set-input-string (runtime string)
+  (let ((old-stream (kl-runtime-stdin runtime))
+        (new-stream (kl--make-buffer-stream 'buffer-input 'in nil string)))
+    (when (and (kl-stream-p old-stream)
+               (buffer-live-p (kl-stream-buffer old-stream)))
+      (setf (kl-stream-closed old-stream) t)
+      (kill-buffer (kl-stream-buffer old-stream)))
+    (setf (kl-runtime-stdin runtime) new-stream)
+    (puthash '*stinput* new-stream (kl-runtime-globals runtime))
+    new-stream))
 
 (defun kl--signal (format-string &rest args)
   (signal 'kl-error (list (apply #'format format-string args))))
@@ -335,6 +355,7 @@
                 (gethash '*init* (kl-runtime-globals runtime))))
        (_ (kl--signal "Unknown get-time argument %S" (car args)))))
     ('shen.char-stinput? (kl--bool (and (kl-stream-p (car args))
+                                        (eq (kl-stream-kind (car args)) 'standard-input)
                                         (eq (kl-stream-mode (car args)) 'in))))
     ('shen.char-stoutput? (kl--bool (and (kl-stream-p (car args))
                                          (eq (kl-stream-mode (car args)) 'out))))
