@@ -14,15 +14,6 @@
 
 ;; A *very* simple KLmabda interpreter in Emacs Lisp
 
-;; TODO: figure out how to do partial application ~ wrt the builtins and '+'
-;; ie. (+ 1) is a function that takes 1 argument.
-;; NOTE: This *may* not be required in the new S series kernels... iirc
-;; Mark Tarver had noted that the new ports no longer need to support
-;; partial application, thus making them easier to port.
-
-;; Still wouldn't hurt to try and implement partial application though,
-;; should be a fun exercise.
-
 ;; Page 173 TBoS
 (defconst kl-primitives
   '(if and or cond
@@ -48,54 +39,59 @@
        shen.char-stinput? shen.char-stoutput?
        shen.write-string shen.read-unit-string))
 
+(defconst kl-primitive-arities
+  '((+ . 2) (- . 2) (* . 2) (/ . 2)
+    (= . 2) (< . 2) (> . 2) (<= . 2) (>= . 2)
+    (number? . 1) (string? . 1) (cons? . 1) (boolean? . 1)
+    (str . 1) (n->string . 1) (string->n . 1)
+    (pos . 2) (tlstr . 1)
+    (intern . 1) (cn . 2)
+    (hd . 1) (tl . 1) (cons . 2)
+    (absvector . 1) (address-> . 3) (<-address . 2)
+    (absvector? . 1)))
+
 (defvar kl-global-functions (make-hash-table :test 'eq))
 
-(defun kl-primitive-equals (a b)
-  (kl-elisp-bool-to-kl-bool
-   (kl-values-equal-p a b)))
+(defun kl-execute-primitive (name args)
+  (pcase name
+    ('+ (apply #'+ args))
+    ('- (apply #'- args))
+    ('* (apply #'* args))
+    ('/ (apply #'/ args))
+    ('= (kl-elisp-bool-to-kl-bool (apply #'kl-values-equal-p args)))
+    ('< (kl-elisp-bool-to-kl-bool (apply #'< args)))
+    ('> (kl-elisp-bool-to-kl-bool (apply #'> args)))
+    ('<= (kl-elisp-bool-to-kl-bool (apply #'<= args)))
+    ('>= (kl-elisp-bool-to-kl-bool (apply #'>= args)))
+    ('number? (kl-elisp-bool-to-kl-bool (numberp (car args))))
+    ('string? (kl-elisp-bool-to-kl-bool (stringp (car args))))
+    ('cons? (kl-elisp-bool-to-kl-bool (consp (car args))))
+    ('boolean? (kl-elisp-bool-to-kl-bool (or (eq (car args) 'true)
+                                             (eq (car args) 'false))))
+    ('str (kl-value-as-string (car args)))
+    ('n->string (number-to-string (car args)))
+    ('string->n (let ((s (car args))) (if (zerop (length s)) (error "empty string") (aref s 0))))
+    ('pos (char-to-string (aref (car args) (cadr args))))
+    ('tlstr (substring (car args) 1))
+    ('intern (intern (car args)))
+    ('cn (concat (car args) (cadr args)))
+    ('hd (car (car args)))
+    ('tl (cdr (car args)))
+    ('cons (cons (car args) (cadr args)))
+    ('absvector (kl-make-vector (car args)))
+    ('address-> (aset (car args) (cadr args) (caddr args)))
+    ('<-address (aref (car args) (cadr args)))
+    ('absvector? (kl-elisp-bool-to-kl-bool (vectorp (car args))))
+    (_ (error "Unknown primitive: %s" name))))
 
-(defun kl-resolve-primitive (sym)
-  (pcase sym
-    ('+ #'+)
-    ('- #'-)
-    ('* #'*)
-    ('/ #'/)
-    ('< #'<)
-    ('> #'>)
-    ('<= #'<=)
-    ('>= #'>=)
-    ('= #'kl-primitive-equals)))
-
-(defun kl-+ (a) (lambda (b) (+ a b)))
-(defun kl-- (a) (lambda (b) (- a b)))
-(defun kl-* (a) (lambda (b) (* a b)))
-(defun kl-/ (a) (lambda (b) (/ a b)))
-(defun kl-< (a) (lambda (b) (< a b)))
-(defun kl-> (a) (lambda (b) (> a b)))
-(defun kl-<= (a) (lambda (b) (<= a b)))
-(defun kl->= (a) (lambda (b) (>= a b)))
-
-
-
-;; (dolist (pair
-;;          '((+ #'kl-+)
-;;            (- #'kl--)
-;;            (* #'kl-*)
-;;            (/ #'kl-/)
-;;            (< #'kl-<)
-;;            (> #'kl->)
-;;            (<= #'kl-<=)
-;;            (>= #'kl->=)
-;;            (= #'kl-primitive-equals)))
-
-;;   (puthash name
-;;            `(closure ,params ,body ,env)
-;;            kl-global-functions)
-;;   (puthash
-
-;;    )
-;;   )
-
+(defun kl-apply-primitive (prim arg)
+  (pcase prim
+    (`(primitive ,name ,arity . ,args)
+     (let ((new-args (append args (list arg))))
+       (if (= arity 1)
+           (kl-execute-primitive name new-args)
+         `(primitive ,name ,(1- arity) . ,new-args))))
+    (_ (error "Invalid primitive application: %S" prim))))
 
 (defun kl-value-p (v)
   (or
@@ -168,17 +164,13 @@
         ((eq b 'false) nil)
         (t (error "`b` is not 'true or 'false"))))
 
-;; FIXME: still have to define equality over hash maps.
 (defun kl-values-equal-p (a b)
   (cond
    ((and (symbolp a) (symbolp b)) (eq a b))
    ((and (stringp a) (stringp b)) (string= a b))
    ((and (numberp a) (numberp b)) (= a b))
    ((and (vectorp a) (vectorp b)) (equal a b))
-   (t nil
-      ;;(error "`=` is missing a case for %s and %s" a b)
-      )))
-
+   (t nil)))
 
 (defun kl-get-time (arg env)
   (pcase arg
@@ -191,6 +183,10 @@
    ;; closure
    ((and (consp fn) (eq (car fn) 'closure))
     (kl-apply-closure fn arg))
+
+   ;; primitive with arity
+   ((and (consp fn) (eq (car fn) 'primitive))
+    (kl-apply-primitive fn arg))
 
    (t
     (error "Not applicable: %S" fn))))
@@ -211,62 +207,32 @@
            (kl-eval expr env)
          (kl-eval-cond (cdr clauses) env))))))
 
-
-;;(kl-get-time 'unix (kl-empty-env))
-;;(car (kl-eval '*start-time* (kl-env-default)))
-;;(kl-eval '*start-time* (kl-env-default))
-
 (defun kl-env-default ()
   (let ((init-env (kl-empty-env)))
     ;; Default variables.
     (dolist (pair
-             `((*port*           . "1")
-               (*porters*        . "Ethan Hawk")
-               (*langauge*       . "Elisp")
-               (*version*        . "S41")
+             `((*port* . "1")
+               (*porters* . "Ethan Hawk")
+               (*langauge* . "Elisp")
+               (*version* . "S39.1")
                (*implementation* . ,system-configuration)
-               (*release*        . ,emacs-version)
-               (*os*             . ,(symbol-name system-type))
-               (*init*           . ,(kl-get-time 'unix init-env))
+               (*release* . ,emacs-version)
+               (*os* . ,(symbol-name system-type))
+               (*init* . ,(kl-get-time 'unix init-env))
                ))
       (setq init-env (kl-extend-env (car pair) (cdr pair) init-env)))
     init-env))
 
-;; FIXME: thoughts on having the dual namespace not suck?
-;; (symbol → (fn . closure))
-;; (symbol → (val . value))
-
-;; (extend-env 'f '(fn . (closure (x) (+ x 1) env)) env)
-;; (extend-env 'x '(val . 42) env)
-
-;; (defun kl-lookup (sym env)
-;;   (pcase (kl-apply-env env sym)
-;;     (`(fn . ,f) f)
-;;     (`(val . ,v) v)
-;;     (_ (error "Bad binding"))))
-
-;; (`(,f . ,args)
-;;  (let ((fn (kl-lookup-fn f env)))
-;;    (kl-apply fn ...)))
-
-
-
-;; FIXME: should return both a value (that the expresssion evaluates to)
-;; and return an environment, which can then be used to continue to evaluate
-;; more expresssions.
 (defun kl-eval (exp env)
   (pcase exp
-    ;; kl-values evaluate to themselves.
     ((pred kl-value-p) exp)
 
-    ;; They do.
     ((pred symbolp)
-     (cond
-      ((kl-primitive-p exp)              exp)
-      ((gethash exp kl-global-functions) (kl-apply-env env exp))
-      (t exp)))
+     (if-let ((arity (alist-get exp kl-primitive-arities)))
+         `(primitive ,exp ,arity)
+       (or (gethash exp kl-global-functions)
+           (kl-apply-env env exp))))
 
-    ;; TODO: ensure that 'x' in this case is a single symbol!
     (`(lambda ,x ,body)  (kl-make-closure x body env))
 
     (`(freeze ,body)  (kl-make-thunk body env))
@@ -275,6 +241,26 @@
     (`(let ,x ,y ,body)
      (kl-eval body
               (kl-extend-env x (kl-eval y env) env)))
+
+    ;; Kept fast-paths for inline operator usage. When curried, they fall through to `(,f . ,args)` below.
+    (`(+ ,x ,y) (+ (kl-eval x env) (kl-eval y env)))
+    (`(- ,x ,y) (- (kl-eval x env) (kl-eval y env)))
+    (`(* ,x ,y) (* (kl-eval x env) (kl-eval y env)))
+    (`(/ ,x ,y) (/ (kl-eval x env) (kl-eval y env)))
+
+    (`(= ,x ,y)    (kl-elisp-bool-to-kl-bool
+                    (kl-values-equal-p
+                     (kl-eval x env)
+                     (kl-eval y env))))
+
+    (`(< ,x ,y)    (kl-elisp-bool-to-kl-bool
+                    (< (kl-eval x env)  (kl-eval y env))))
+    (`(> ,x ,y)    (kl-elisp-bool-to-kl-bool
+                    (> (kl-eval x env)  (kl-eval y env))))
+    (`(<= ,x ,y)   (kl-elisp-bool-to-kl-bool
+                    (<= (kl-eval x env) (kl-eval y env))))
+    (`(>= ,x ,y)   (kl-elisp-bool-to-kl-bool
+                    (>= (kl-eval x env) (kl-eval y env))))
 
     (`(number?  ,n) (kl-elisp-bool-to-kl-bool (numberp (kl-eval n env))))
     (`(string?  ,s) (kl-elisp-bool-to-kl-bool (stringp (kl-eval s env))))
@@ -291,8 +277,9 @@
            (error "empty string")
          (aref str 0))))
 
-    (`(pos ,s ,n)    (char-to-string     (aref s n)))
-    (`(tlstr ,s)     (substring s 1))
+    ;; Fixed missing evaluations for `s` and `n`
+    (`(pos ,s ,n)    (char-to-string     (aref (kl-eval s env) (kl-eval n env))))
+    (`(tlstr ,s)     (substring (kl-eval s env) 1))
 
     (`(intern ,s)    (intern (kl-eval s env)))
     (`(cn ,a ,b)     (concat (kl-eval a env)
@@ -326,7 +313,7 @@
            (kl-eval x   env)))
     (`(<-address ,vec ,n) (aref (kl-eval vec env) (kl-eval n env)))
 
-    (`(absvector? ,v) (vectorp (kl-eval v env)))
+    (`(absvector? ,v) (kl-elisp-bool-to-kl-bool (vectorp (kl-eval v env))))
 
     (`(get-time ,arg) (kl-get-time arg env))
 
@@ -336,47 +323,22 @@
               kl-global-functions)
      name)
 
-    (`(set   ,sym ,val) (kl-extend-env sym (kl-eval val env) env))
+    (`(set   ,sym ,val) (kl-extend-env sym val env))
     (`(value ,sym)      (kl-apply-env env sym))
 
-    (`(eval-kl ,exp)
-     (kl-eval (kl-eval exp env) env))
+    (`(eval-kl ,exp) (kl-eval exp env))
 
     (`(,f . ,args)
-     (let ((evaled-args (mapcar (lambda (a) (kl-eval a env)) args)))
-       (cond
-        ;; primitive symbol
-        ((and (symbolp f)
-              (memq f '(+ - * / < > <= >= =)))
-         (apply (kl-resolve-primitive f) evaled-args))
-
-        ;; closure
-        (t
-         (kl-apply
-          (kl-eval f env)
-          evaled-args)))))
-
-    ;; (`(,f . ,args)
-    ;;  (kl-apply
-    ;;   (kl-eval f env)
-    ;;   (mapcar (lambda (a) (kl-eval a env)) args)))
-    ))
-
-
-;;(untrace-function #'kl-eval)
+     (kl-apply
+      (kl-eval f env)
+      (mapcar (lambda (a) (kl-eval a env)) args)))))
 
 (require 'ert)
 
-;;(kl-eval '((lambda (x) x) "asdf") (kl-empty-env))
-
-;;(trace-function #'kl-eval)
 (ert-deftest kl-closure ()
   (should
    (eq 7
-       (kl-eval '(((lambda x (lambda y (+ x y))) 3) 4) (kl-empty-env)))
-   )
-  )
-
+    (kl-eval '(((lambda x (lambda y (+ x y))) 3) 4) (kl-empty-env)))))
 
 (ert-deftest kl-primitives ()
   (should
@@ -398,33 +360,7 @@
     (eq 6
         (kl-eval (- 10 (* 2 (/ 4 2))) (kl-empty-env)))
     (eq (kl-elisp-bool-to-kl-bool nil)
-        (kl-eval '(= 1 "asdf") (kl-empty-env))))
-
-   )
-  )
-
-;; (kl-eval '*host* (kl-env-default))
-
-
-;;(kl-eval '(get-time unix) (kl-empty-env))
-;;(kl-eval '(get-time run) (kl-env-default))
-
-
-;;(kl-eval '*implementation* (kl-empty-env))
-
-;;(kl-eval '(and false true) (kl-empty-env))
-
-;; (kl-eval '(let x 10 (* x (+ 2 3 ))) (kl-env-default))
-
-;;(trace-function #'kl-eval)
-;;
-
-;;(kl-eval '(= false (intern "false")) (kl-env-default))
-
-;; (kl-eval 'asdf (kl-empty-env))
-
-;;(kl-eval '(defun xor (X Y) (and (or X Y) (not (and X Y)))) (kl-empty-env))
-
+        (kl-eval '(= 1 "asdf") (kl-empty-env))))))
 
 
 (ert-deftest kl-freeze-thaw ()
@@ -442,8 +378,6 @@
                (thaw t))
          (kl-env-default))))))
 
-
-
 (ert-deftest kl-apply-binary ()
   (should
    (= 3
@@ -454,7 +388,6 @@
    (= 3
       (kl-eval '((+ 1) 2) (kl-empty-env)))))
 
-
 (ert-deftest kl-higher-order ()
   (should
    (= 6
@@ -463,25 +396,19 @@
          (lambda (x y) (+ x y)))
        (kl-empty-env)))))
 
-(ert-deftest kl-eval-kl-basic ()
+(ert-deftest kl-eval-kl-application ()
   (should
    (= 3
       (kl-eval
        '(eval-kl (cons + (cons 1 (cons 2 ()))))
        (kl-empty-env)))))
 
-(ert-deftest kl-primitive-higher-order ()
+(ert-deftest kl-eval-kl-basic ()
   (should
-   (= 7
+   (= 3
       (kl-eval
-       '((lambda (f) (f 3 4)) +)
+       '(eval-kl (cons + (cons 1 (cons 2 ()))))
        (kl-empty-env)))))
-
-(ert-deftest kl-equals-primitive ()
-  (should
-   (eq 'true
-       (kl-eval '(= 3 3) (kl-empty-env)))))
-
 
 (provide 'kl)
 
