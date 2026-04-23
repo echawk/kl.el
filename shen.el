@@ -230,11 +230,11 @@ Return the printed REPL output."
   (interactive)
   (if (ring-empty-p shen--input-ring)
       (user-error "No Shen REPL history")
-    (unless shen--history-index
+    (if shen--history-index
+        (when (< (1+ shen--history-index) (ring-length shen--input-ring))
+          (setq shen--history-index (1+ shen--history-index)))
       (setq shen--saved-input (shen--current-input)
             shen--history-index 0))
-    (when (< (1+ shen--history-index) (ring-length shen--input-ring))
-      (setq shen--history-index (1+ shen--history-index)))
     (shen--replace-current-input (ring-ref shen--input-ring shen--history-index))
     (goto-char (point-max))))
 

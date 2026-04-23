@@ -16,6 +16,7 @@
 
 (require 'cl-lib)
 (require 'ert)
+(require 'ring)
 (require 'subr-x)
 
 (define-error 'kl-error "KLambda error")
@@ -52,6 +53,38 @@
 
 (defconst kl-special-forms
   '(and cond defun do eval-kl freeze if lambda let or set thaw trap-error type value))
+
+(defgroup kl nil
+  "KLambda support in Emacs."
+  :group 'languages)
+
+(defcustom kl-repl-buffer-name "*KLambda*"
+  "Name of the KLambda REPL buffer."
+  :type 'string
+  :group 'kl)
+
+(defcustom kl-repl-input-ring-size 128
+  "Maximum number of entries retained in KLambda REPL history."
+  :type 'integer
+  :group 'kl)
+
+(defface kl-repl-prompt-face
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face used for KLambda REPL prompts."
+  :group 'kl)
+
+(defvar kl--default-runtime nil)
+
+(defvar-local kl--repl-runtime nil)
+(defvar-local kl--repl-input-start nil)
+(defvar-local kl--repl-input-ring nil)
+(defvar-local kl--repl-history-index nil)
+(defvar-local kl--repl-saved-input "")
+(defvar-local kl--repl-turn 0)
+
+(defconst kl--repl-completion-delimiters
+  '(?\s ?\t ?\n ?\( ?\) ?\[ ?\] ?\{ ?\} ?\" ?\' ?\` ?, ?\;)
+  "Characters that delimit KLambda tokens in the REPL.")
 
 (defun kl--make-buffer-stream (kind mode &optional path initial-contents)
   (let ((buffer (generate-new-buffer
@@ -613,6 +646,280 @@
   (setq runtime (or runtime (kl-runtime-reset)))
   (kl-load-files kl-kernel-load-order runtime))
 
+(defun kl--make-runtime ()
+  (kl-runtime-reset))
+
+(defun kl--ensure-default-runtime ()
+  (or kl--default-runtime
+      (setq kl--default-runtime (kl--make-runtime))))
+
+(defun kl--ensure-buffer-runtime ()
+  (or kl--repl-runtime
+      (setq kl--repl-runtime (kl--make-runtime))))
+
+(defun kl--skip-read-junk ()
+  (let ((moved t))
+    (while moved
+      (setq moved nil)
+      (skip-chars-forward " \t\n\r\f")
+      (when (eq (char-after) ?\;)
+        (forward-line 1)
+        (setq moved t)))))
+
+(defun kl--read-string-forms (string)
+  (with-temp-buffer
+    (insert string)
+    (goto-char (point-min))
+    (let (forms)
+      (condition-case nil
+          (while (progn
+                   (kl--skip-read-junk)
+                   (not (eobp)))
+            (push (read (current-buffer)) forms))
+        (end-of-file
+         (kl--signal "Incomplete KLambda form")))
+      (nreverse forms))))
+
+(defun kl--join-repl-output (stdout trailing-output)
+  (cond
+   ((string-empty-p stdout) trailing-output)
+   ((string-empty-p trailing-output) stdout)
+   ((string-suffix-p "\n" stdout) (concat stdout trailing-output))
+   (t (concat stdout "\n" trailing-output))))
+
+(defun kl/eval-string (string &optional runtime)
+  "Evaluate STRING as KLambda input.
+
+Return REPL-style output, including printed side effects and the final value."
+  (let ((runtime (or runtime
+                     (if (derived-mode-p 'kl-repl-mode)
+                         (kl--ensure-buffer-runtime)
+                       (kl--ensure-default-runtime))))
+        result)
+    (kl-runtime-clear-output runtime)
+    (condition-case err
+        (let ((forms (kl--read-string-forms string)))
+          (dolist (form forms)
+            (setq result (kl-eval form runtime)))
+          (kl--join-repl-output
+           (kl-runtime-drain-output runtime)
+           (if forms
+               (concat (kl-render-value result) "\n")
+             "")))
+      (error
+       (kl--join-repl-output
+        (kl-runtime-drain-output runtime)
+        (concat (error-message-string err) "\n"))))))
+
+(defun kl--insert-read-only (string &optional face)
+  (let ((inhibit-read-only t)
+        (start (point-max)))
+    (goto-char (point-max))
+    (insert string)
+    (add-text-properties
+     start (point-max)
+     `(read-only t
+       rear-nonsticky (read-only)
+       front-sticky (read-only)
+       ,@(when face `(face ,face))))))
+
+(defun kl--prompt-string ()
+  (format "%d #> " kl--repl-turn))
+
+(defun kl--insert-prompt ()
+  (kl--insert-read-only (kl--prompt-string) 'kl-repl-prompt-face)
+  (set-marker kl--repl-input-start (point-max))
+  (goto-char (point-max)))
+
+(defun kl--current-input ()
+  (buffer-substring-no-properties (marker-position kl--repl-input-start)
+                                  (point-max)))
+
+(defun kl--replace-current-input (string)
+  (let ((inhibit-read-only t))
+    (goto-char (marker-position kl--repl-input-start))
+    (delete-region (marker-position kl--repl-input-start) (point-max))
+    (insert string)))
+
+(defun kl--seal-current-input ()
+  (add-text-properties
+   (marker-position kl--repl-input-start) (point-max)
+   '(read-only t rear-nonsticky (read-only) front-sticky (read-only))))
+
+(defun kl--completion-runtime ()
+  (or kl--repl-runtime kl--default-runtime))
+
+(defun kl--completion-token-char-p (char)
+  (and char
+       (not (memq char kl--repl-completion-delimiters))))
+
+(defun kl--bounds-of-token-at-point ()
+  (when (and kl--repl-input-start
+             (>= (point) (marker-position kl--repl-input-start)))
+    (let ((origin (point))
+          (limit (marker-position kl--repl-input-start))
+          start
+          end)
+      (save-excursion
+        (while (and (> (point) limit)
+                    (kl--completion-token-char-p (char-before)))
+          (backward-char))
+        (setq start (point))
+        (goto-char origin)
+        (while (kl--completion-token-char-p (char-after))
+          (forward-char))
+        (setq end (point)))
+      (when (< start end)
+        (cons start end)))))
+
+(defun kl--completion-candidates (runtime)
+  (let ((seen (make-hash-table :test 'equal))
+        names)
+    (dolist (symbol '(true false))
+      (puthash (symbol-name symbol) t seen))
+    (dolist (symbol kl-special-forms)
+      (puthash (symbol-name symbol) t seen))
+    (dolist (pair kl-primitive-arities)
+      (puthash (symbol-name (car pair)) t seen))
+    (maphash
+     (lambda (symbol _value)
+       (when (symbolp symbol)
+         (puthash (symbol-name symbol) t seen)))
+     (kl-runtime-functions runtime))
+    (maphash
+     (lambda (symbol _value)
+       (when (symbolp symbol)
+         (puthash (symbol-name symbol) t seen)))
+     (kl-runtime-globals runtime))
+    (maphash (lambda (name _present) (push name names)) seen)
+    (sort names #'string<)))
+
+(defun kl-repl-completion-at-point ()
+  "Return completion data for the KLambda REPL input at point."
+  (let ((runtime (kl--completion-runtime))
+        (bounds (kl--bounds-of-token-at-point)))
+    (when (and runtime bounds)
+      (list (car bounds)
+            (cdr bounds)
+            (completion-table-dynamic
+             (lambda (_prefix)
+               (kl--completion-candidates runtime)))
+            :exclusive 'no))))
+
+(defun kl--record-input (input)
+  (unless (string-blank-p input)
+    (ring-insert kl--repl-input-ring input))
+  (setq kl--repl-history-index nil
+        kl--repl-saved-input ""))
+
+(defun kl-repl-return ()
+  "Evaluate the current KLambda input."
+  (interactive)
+  (when (< (point) (marker-position kl--repl-input-start))
+    (goto-char (point-max)))
+  (let* ((runtime (kl--ensure-buffer-runtime))
+         (input (kl--current-input))
+         (output (kl/eval-string input runtime)))
+    (kl--record-input input)
+    (kl--seal-current-input)
+    (kl--insert-read-only "\n")
+    (kl--insert-read-only output)
+    (setq kl--repl-turn (1+ kl--repl-turn))
+    (kl--insert-prompt)))
+
+(defun kl-repl-previous-input ()
+  "Replace current input with the previous REPL history entry."
+  (interactive)
+  (if (ring-empty-p kl--repl-input-ring)
+      (user-error "No KLambda REPL history")
+    (if kl--repl-history-index
+        (when (< (1+ kl--repl-history-index) (ring-length kl--repl-input-ring))
+          (setq kl--repl-history-index (1+ kl--repl-history-index)))
+      (setq kl--repl-saved-input (kl--current-input)
+            kl--repl-history-index 0))
+    (kl--replace-current-input (ring-ref kl--repl-input-ring kl--repl-history-index))
+    (goto-char (point-max))))
+
+(defun kl-repl-next-input ()
+  "Replace current input with the next REPL history entry."
+  (interactive)
+  (unless kl--repl-history-index
+    (user-error "No newer KLambda REPL history"))
+  (if (zerop kl--repl-history-index)
+      (progn
+        (setq kl--repl-history-index nil)
+        (kl--replace-current-input kl--repl-saved-input))
+    (setq kl--repl-history-index (1- kl--repl-history-index))
+    (kl--replace-current-input (ring-ref kl--repl-input-ring kl--repl-history-index)))
+  (goto-char (point-max)))
+
+(defun kl-repl-beginning-of-line ()
+  "Move to the start of the editable KLambda input."
+  (interactive)
+  (if (>= (point) (marker-position kl--repl-input-start))
+      (goto-char (marker-position kl--repl-input-start))
+    (move-beginning-of-line 1)))
+
+(defun kl-repl-clear-buffer ()
+  "Clear the KLambda REPL buffer, keeping the current runtime."
+  (interactive)
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (when kl--repl-runtime
+      (kl--insert-prompt))))
+
+(defun kl-repl-reset ()
+  "Reset the KLambda REPL runtime and buffer."
+  (interactive)
+  (let ((inhibit-read-only t))
+    (erase-buffer))
+  (setq kl--repl-runtime nil
+        kl--repl-history-index nil
+        kl--repl-saved-input ""
+        kl--repl-turn 0)
+  (setq kl--repl-input-ring (make-ring kl-repl-input-ring-size))
+  (kl--ensure-buffer-runtime)
+  (kl--insert-prompt))
+
+(defvar kl-repl-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map text-mode-map)
+    (define-key map (kbd "RET") #'kl-repl-return)
+    (define-key map (kbd "TAB") #'completion-at-point)
+    (define-key map (kbd "<tab>") #'completion-at-point)
+    (define-key map (kbd "M-p") #'kl-repl-previous-input)
+    (define-key map (kbd "M-n") #'kl-repl-next-input)
+    (define-key map (kbd "C-a") #'kl-repl-beginning-of-line)
+    (define-key map (kbd "C-c C-r") #'kl-repl-reset)
+    (define-key map (kbd "C-c M-o") #'kl-repl-clear-buffer)
+    map))
+
+(define-derived-mode kl-repl-mode text-mode "KLambda-REPL"
+  "Major mode for interacting with a KLambda runtime."
+  (setq-local indent-line-function #'ignore)
+  (setq-local comment-start ";")
+  (setq-local comment-end "")
+  (setq-local kl--repl-input-ring (make-ring kl-repl-input-ring-size))
+  (setq-local kl--repl-history-index nil)
+  (setq-local kl--repl-saved-input "")
+  (setq-local kl--repl-turn 0)
+  (setq-local complete-at-point-functions '(kl-repl-completion-at-point))
+  (setq-local kl--repl-input-start (copy-marker (point-max) nil)))
+
+(defun kl/repl (&optional reset)
+  "Open a KLambda REPL buffer.
+
+With prefix argument RESET, reinitialize the runtime."
+  (interactive "P")
+  (let ((buffer (get-buffer-create kl-repl-buffer-name)))
+    (pop-to-buffer buffer)
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'kl-repl-mode)
+        (kl-repl-mode))
+      (when (or reset (null kl--repl-runtime))
+        (kl-repl-reset))
+      (goto-char (point-max)))))
+
 (defun kl--validator-output (program)
   (with-temp-buffer
     (insert program)
@@ -633,6 +940,9 @@
   (declare (indent 1))
   `(let* ((runtime (or ,(car bindings) (kl-runtime-reset))))
      ,@body))
+
+(ert-deftest kl-eval-string ()
+  (should (equal "3\n" (kl/eval-string "(+ 1 2)" (kl-runtime-reset)))))
 
 (ert-deftest kl-basic-evaluation ()
   (let ((runtime (kl-runtime-reset)))
@@ -708,6 +1018,51 @@
           (setq result (kl-eval form runtime)))
         (should (equal (kl-render-value result)
                        (kl--validator-last-result expr)))))))
+
+(ert-deftest kl-repl-return-prints-result ()
+  (with-temp-buffer
+    (kl-repl-mode)
+    (setq kl--repl-runtime (kl-runtime-reset))
+    (kl--insert-prompt)
+    (goto-char (point-max))
+    (insert "(+ 1 2)")
+    (kl-repl-return)
+    (should (string-match-p (regexp-quote "\n3\n")
+                            (buffer-string)))
+    (should (string-suffix-p "1 #> " (buffer-string)))))
+
+(ert-deftest kl-repl-completion-at-point-offers-runtime-symbols ()
+  (with-temp-buffer
+    (kl-repl-mode)
+    (setq kl--repl-runtime (kl-runtime-reset))
+    (kl-eval '(defun always () 42) kl--repl-runtime)
+    (insert "(alw")
+    (set-marker kl--repl-input-start (point-min))
+    (goto-char (point-max))
+    (pcase-let ((`(,start ,end ,table . ,_) (kl-repl-completion-at-point)))
+      (should (equal "alw"
+                     (buffer-substring-no-properties start end)))
+      (should (member "always"
+                      (all-completions "alw" table))))))
+
+(ert-deftest kl-repl-history-navigation ()
+  (with-temp-buffer
+    (kl-repl-mode)
+    (setq kl--repl-runtime (kl-runtime-reset))
+    (kl--insert-prompt)
+    (goto-char (point-max))
+    (insert "(+ 1 2)")
+    (kl-repl-return)
+    (insert "(* 2 3)")
+    (kl-repl-return)
+    (kl-repl-previous-input)
+    (should (equal "(* 2 3)" (kl--current-input)))
+    (kl-repl-previous-input)
+    (should (equal "(+ 1 2)" (kl--current-input)))
+    (kl-repl-next-input)
+    (should (equal "(* 2 3)" (kl--current-input)))
+    (kl-repl-next-input)
+    (should (equal "" (kl--current-input)))))
 
 (provide 'kl)
 
