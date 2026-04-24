@@ -30,6 +30,12 @@
   :type 'string
   :group 'shen)
 
+(defcustom shen-backend 'interpreter
+  "KL backend used when booting Shen runtimes."
+  :type '(choice (const :tag "Interpreter" interpreter)
+                 (const :tag "Compiler" compiler))
+  :group 'shen)
+
 (defcustom shen-repl-input-ring-size 128
   "Maximum number of entries retained in Shen REPL input history."
   :type 'integer
@@ -53,7 +59,7 @@
   "Characters that delimit Shen tokens in the REPL.")
 
 (defun shen--make-runtime ()
-  (let ((runtime (kl-runtime-reset)))
+  (let ((runtime (kl-runtime-reset nil shen-backend)))
     (kl-load-kernel runtime)
     (kl-eval '(shen.initialise) runtime)
     runtime))
