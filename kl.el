@@ -830,6 +830,17 @@ With prefix argument RESET, reinitialize the runtime."
     (kl-eval '(defun always () 42) runtime)
     (should (= 42 (kl-eval '(always) runtime)))))
 
+(ert-deftest kl-compiler-preserves-lexical-cons-bindings ()
+  (let ((runtime (kl-runtime-reset nil 'compiler)))
+    (kl-eval '(defun singleton (X) (cons X ())) runtime)
+    (should (equal '(5) (kl-eval '(singleton 5) runtime)))))
+
+(ert-deftest kl-compiler-direct-calls-run-tail-results ()
+  (let ((runtime (kl-runtime-reset nil 'compiler)))
+    (kl-eval '(defun apply1 (F X) (F X)) runtime)
+    (kl-eval '(defun wrap (X) (+ 1 (apply1 (lambda Y (+ Y 1)) X))) runtime)
+    (should (= 7 (kl-eval '(wrap 5) runtime)))))
+
 (ert-deftest kl-globals-and-errors ()
   (let ((runtime (kl-runtime-reset)))
     (should (= 1 (kl-eval '(set x 1) runtime)))
@@ -894,6 +905,17 @@ With prefix argument RESET, reinitialize the runtime."
 
 (ert-deftest kl-initialises-shen-runtime ()
   (let ((runtime (kl-runtime-reset)))
+    (kl-load-kernel runtime)
+    (kl-eval '(shen.initialise) runtime)
+    (should (= 2 (kl-eval '(arity cons) runtime)))
+    (should (equal "41.2" (kl-eval '(value *version*) runtime)))
+    (should (eq 'false (kl-eval '(value shen.*tc*) runtime)))
+    (should (= 3
+               (kl-eval '(eval (cons + (cons 1 (cons 2 ()))))
+                        runtime)))))
+
+(ert-deftest kl-compiler-initialises-shen-runtime ()
+  (let ((runtime (kl-runtime-reset nil 'compiler)))
     (kl-load-kernel runtime)
     (kl-eval '(shen.initialise) runtime)
     (should (= 2 (kl-eval '(arity cons) runtime)))

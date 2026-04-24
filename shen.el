@@ -22,7 +22,7 @@
 (require 'subr-x)
 
 (defgroup shen nil
-  "Shen support backed by the kl.el interpreter."
+  "Shen support backed by kl.el runtimes."
   :group 'languages)
 
 (defcustom shen-repl-buffer-name "*Shen*"
@@ -30,7 +30,7 @@
   :type 'string
   :group 'shen)
 
-(defcustom shen-backend 'interpreter
+(defcustom shen-backend 'compiler
   "KL backend used when booting Shen runtimes."
   :type '(choice (const :tag "Interpreter" interpreter)
                  (const :tag "Compiler" compiler))
