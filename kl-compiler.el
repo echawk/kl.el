@@ -18,6 +18,7 @@
 (defvar kl--compiler-current-runtime-var nil)
 (defvar kl--compiler-loop-continue-var nil)
 (defvar kl--compiler-loop-tag nil)
+(defvar kl--compiler-current-source-file nil)
 
 (defun kl-make-compiled-function (runtime impl arity &rest args)
   (apply #'list 'compiled runtime impl arity args))
@@ -258,6 +259,16 @@
          (and arity
               (= arity (length args))))))
 
+(defun kl--compiler-source-file-name ()
+  (and kl--compiler-current-source-file
+       (file-name-nondirectory kl--compiler-current-source-file)))
+
+(defun kl--compiler-use-interpreter-wrapper-p (name)
+  (let ((file-name (kl--compiler-source-file-name)))
+    (and file-name
+         (member file-name kl-compiler-interpreted-files)
+         (not (memq name kl-compiler-compiled-function-overrides)))))
+
 (defun kl--compiler-self-tailcall-form (arg-forms)
   (let ((temp-vars (mapcar (lambda (_)
                              (kl--compiler-gensym "kl-next"))
@@ -324,6 +335,32 @@
                  (lambda ,arg-vars
                    (,fn-symbol ,runtime-var ,@arg-vars))
                  ,(length params-list))
+                (kl-runtime-functions ,runtime-var))
+       ',name)))
+
+(defun kl--compiler-compile-interpreted-defun (name params body runtime-var)
+  (let* ((params-list (kl--compiler-normalize-params params))
+         (arg-vars (mapcar (lambda (_param)
+                             (kl--compiler-gensym "kl-arg"))
+                           params-list))
+         (shadow-var (kl--compiler-gensym "kl-shadow-runtime"))
+         (callable-var (kl--compiler-gensym "kl-callable"))
+         (fn-symbol (kl--compiler-function-symbol name))
+         (closure-form
+          `(list
+            'closure
+            ,shadow-var
+            ',params-list
+            ',body
+            nil)))
+    `(let* ((,shadow-var (kl-runtime-shadow ,runtime-var 'interpreter))
+            (,callable-var ,closure-form))
+       (defalias ',fn-symbol
+         (kl--compiler-finalize-function
+          (lambda (_runtime ,@arg-vars)
+            (kl-apply-function ,callable-var (list ,@arg-vars)))))
+       (puthash ',name
+                ,callable-var
                 (kl-runtime-functions ,runtime-var))
        ',name)))
 
@@ -472,7 +509,9 @@
        (progn
          (when kl--compiler-known-arities
            (kl--compiler-register-defun name params))
-         (kl--compiler-compile-defun name params body runtime-var)))
+         (if (kl--compiler-use-interpreter-wrapper-p name)
+             (kl--compiler-compile-interpreted-defun name params body runtime-var)
+           (kl--compiler-compile-defun name params body runtime-var))))
       (`(,fn . ,args)
        (kl--compiler-compile-application fn args env runtime-var tailp))
       (_
@@ -545,7 +584,8 @@ Otherwise fall back to `kl-compiler-cache-directory'."
 
 (defun kl-compile-file-to-el (source output)
   "Compile SOURCE .kl file into OUTPUT .el installer."
-  (let ((kl--compiler-counter 0))
+  (let ((kl--compiler-counter 0)
+        (kl--compiler-current-source-file (expand-file-name source)))
     (let* ((source (expand-file-name source))
            (output (expand-file-name output))
            (installer (kl--compiler-installer-symbol source))

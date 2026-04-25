@@ -91,6 +91,22 @@ directory and reloaded on subsequent compiler-backed boots."
   :type 'boolean
   :group 'kl)
 
+(defcustom kl-compiler-interpreted-files
+  '("yacc.kl" "reader.kl" "macros.kl")
+  "Kernel source files that should stay on the CEK interpreter under the compiler backend.
+
+These files make up Shen's source frontend. Keeping them on the interpreter
+avoids host Lisp nesting failures while preserving compiler-backed bootstrap
+and runtime performance for the rest of the kernel."
+  :type '(repeat string)
+  :group 'kl)
+
+(defcustom kl-compiler-compiled-function-overrides
+  '(shen.assoc->)
+  "KL functions that should stay fully compiled even in interpreted frontend files."
+  :type '(repeat symbol)
+  :group 'kl)
+
 (defcustom kl-repl-buffer-name "*KLambda*"
   "Name of the KLambda REPL buffer."
   :type 'string
@@ -183,6 +199,17 @@ directory and reloaded on subsequent compiler-backed boots."
     (setf (kl-runtime-stdin runtime) new-stream)
     (puthash '*stinput* new-stream (kl-runtime-globals runtime))
     new-stream))
+
+(defun kl-runtime-shadow (runtime backend)
+  "Return a runtime view of RUNTIME with BACKEND, sharing mutable state."
+  (kl-runtime-create
+   :globals (kl-runtime-globals runtime)
+   :functions (kl-runtime-functions runtime)
+   :types (kl-runtime-types runtime)
+   :stdout (kl-runtime-stdout runtime)
+   :stdin (kl-runtime-stdin runtime)
+   :init-time (kl-runtime-init-time runtime)
+   :backend (kl--normalize-backend backend)))
 
 (defun kl--signal (format-string &rest args)
   (signal 'kl-error (list (apply #'format format-string args))))
@@ -481,8 +508,11 @@ directory and reloaded on subsequent compiler-backed boots."
   (if (and (eq (kl-runtime-backend runtime) 'compiler)
            kl-compiler-cache-directory)
       (kl-compiler-load-file path runtime kl-compiler-cache-directory)
-    (dolist (form (kl-read-file path))
-      (kl-eval form runtime)))
+    (let ((kl--compiler-current-source-file
+           (and (eq (kl-runtime-backend runtime) 'compiler)
+                (expand-file-name path))))
+      (dolist (form (kl-read-file path))
+        (kl-eval form runtime))))
   runtime)
 
 (defun kl-load-files (paths &optional runtime)
